@@ -31,6 +31,8 @@ class ResidualVQ(nn.Module):
         dim,
         num_quantizers,
         codebook_dim = None,
+        project_separately = False,     # If True, then each RVQ stage contains seperate projections, and compute residuals in input dimension.
+                                        # Else if False, then perform standard RVQ (include residual computation) in projected lower dimension.  
         shared_codebook = False,
         heads = 1,
         quantize_dropout = False,
@@ -45,16 +47,25 @@ class ResidualVQ(nn.Module):
         codebook_input_dim = codebook_dim * heads
 
         requires_projection = codebook_input_dim != dim
-        self.project_in = nn.Linear(dim, codebook_input_dim) if requires_projection else nn.Identity()
-        self.project_out = nn.Linear(codebook_input_dim, dim) if requires_projection else nn.Identity()
-        self.has_projections = requires_projection
+        self.project_separately = project_separately
+        
+        if self.project_separately is True: # Perform projection in each VectorQuantize class.
+            self.project_in = nn.Identity()
+            self.project_out = nn.Identity()
+            self.has_projections = requires_projection
+        else:                               # Perform projection in ResidualVQ class.
+            self.project_in = nn.Linear(dim, codebook_input_dim) if requires_projection else nn.Identity()
+            self.project_out = nn.Linear(codebook_input_dim, dim) if requires_projection else nn.Identity()
+            self.has_projections = requires_projection
 
         self.num_quantizers = num_quantizers
 
         self.accept_image_fmap = accept_image_fmap
-        self.layers = nn.ModuleList([VectorQuantize(dim = codebook_dim, codebook_dim = codebook_dim, accept_image_fmap = accept_image_fmap, **kwargs) for _ in range(num_quantizers)])
-
-        assert all([not vq.has_projections for vq in self.layers])
+        if self.project_separately is True: # Perform projection in each VectorQuantize class.
+            self.layers = nn.ModuleList([VectorQuantize(dim = dim, codebook_dim = codebook_dim, accept_image_fmap = accept_image_fmap, **kwargs) for _ in range(num_quantizers)])
+        else:                               # Perform projection in ResidualVQ class.
+            self.layers = nn.ModuleList([VectorQuantize(dim = codebook_dim, codebook_dim = codebook_dim, accept_image_fmap = accept_image_fmap, **kwargs) for _ in range(num_quantizers)])
+            assert all([not vq.has_projections for vq in self.layers])
 
         self.quantize_dropout = quantize_dropout and num_quantizers > 1
 
@@ -66,11 +77,12 @@ class ResidualVQ(nn.Module):
         if not shared_codebook:
             return
 
-        first_vq, *rest_vq = self.layers
-        codebook = first_vq._codebook
+        else:
+            first_vq, *rest_vq = self.layers
+            codebook = first_vq._codebook
 
-        for vq in rest_vq:
-            vq._codebook = codebook
+            for vq in rest_vq:
+                vq._codebook = codebook
 
     @property
     def codebooks(self):
@@ -116,7 +128,7 @@ class ResidualVQ(nn.Module):
 
         return all_codes
 
-    def get_output_from_indices(self, indices):
+    def get_output_from_indices(self, indices): # TODO for project_separately == True
         codes = self.get_codes_from_indices(indices)
         codes_summed = reduce(codes, 'q ... -> ...', 'sum')
         return self.project_out(codes_summed)

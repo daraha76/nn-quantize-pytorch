@@ -701,6 +701,7 @@ class VectorQuantize(nn.Module):
         threshold_ema_dead_code = 0,
         channel_last = True,
         accept_image_fmap = False,
+        cb_loss_weight = 1.,
         commitment_weight = 1.,
         commitment_use_cross_entropy_loss = False,
         orthogonal_reg_weight = 0.,
@@ -739,6 +740,7 @@ class VectorQuantize(nn.Module):
         self.commitment_use_cross_entropy_loss = commitment_use_cross_entropy_loss # whether to use cross entropy loss to codebook as commitment loss
 
         self.learnable_codebook = learnable_codebook
+        self.cb_loss_weight = cb_loss_weight
 
         has_codebook_orthogonal_loss = orthogonal_reg_weight > 0
         self.has_codebook_orthogonal_loss = has_codebook_orthogonal_loss
@@ -922,9 +924,9 @@ class VectorQuantize(nn.Module):
 
         if self.training:
             # determine code to use for commitment loss
-            maybe_detach = torch.detach if not self.learnable_codebook or freeze_codebook else identity
+            maybe_detach = torch.detach if (not self.learnable_codebook) or should_inplace_optimize or freeze_codebook else identity
 
-            commit_quantize = maybe_detach(quantize)            
+            quantize_maybe_detach = maybe_detach(quantize)            
 
             # straight through
 
@@ -977,6 +979,20 @@ class VectorQuantize(nn.Module):
         loss = torch.tensor([0.], device = device, requires_grad = self.training)
 
         if self.training:
+            if self.cb_loss_weight > 0 and self.learnable_codebook:
+                if exists(mask):
+                    # with variable lengthed sequences
+                    cb_loss = F.mse_loss(quantize_maybe_detach, x.detach(), reduction = 'none')
+
+                    loss_mask = mask
+                    if is_multiheaded:
+                        loss_mask = repeat(loss_mask, 'b n -> c (b h) n', c = cb_loss.shape[0], h = cb_loss.shape[1] // mask.shape[0])
+
+                    cb_loss = cb_loss[loss_mask].mean()
+                else:
+                    cb_loss = F.mse_loss(quantize_maybe_detach, x.detach()) 
+                loss = loss + cb_loss * self.cb_loss_weight   
+                
             if self.commitment_weight > 0:
                 if self.commitment_use_cross_entropy_loss:
                     if exists(mask):
@@ -990,7 +1006,7 @@ class VectorQuantize(nn.Module):
                 else:
                     if exists(mask):
                         # with variable lengthed sequences
-                        commit_loss = F.mse_loss(commit_quantize, x, reduction = 'none')
+                        commit_loss = F.mse_loss(quantize.detach(), x, reduction = 'none')
 
                         loss_mask = mask
                         if is_multiheaded:
@@ -998,7 +1014,7 @@ class VectorQuantize(nn.Module):
 
                         commit_loss = commit_loss[loss_mask].mean()
                     else:
-                        commit_loss = F.mse_loss(commit_quantize, x)
+                        commit_loss = F.mse_loss(quantize.detach(), x)
 
                 loss = loss + commit_loss * self.commitment_weight
 
