@@ -90,14 +90,14 @@ class ImprovedVQ(nn.Module):
         z_e = self.in_proj(z)  # z_e : (B x D x T)
         z_eq, indices = self.decode_latents(z_e)
 
-        commit_loss = self.commitment_weight * F.mse_loss(z_e, z_eq.detach(), reduction="none").mean()
-        codebook_loss = self.cb_loss_weight * F.mse_loss(z_eq, z_e.detach(), reduction="none").mean()
+        commit_loss = self.commitment_weight * F.mse_loss(z_e, z_eq.detach(), reduction="none").mean([1, 2])
+        codebook_loss = self.cb_loss_weight * F.mse_loss(z_eq, z_e.detach(), reduction="none").mean([1, 2])
 
         z_eq = z_e + (z_eq - z_e).detach()  # noop in forward pass, straight-through gradient estimator in backward pass
 
         z_q = self.out_proj(z_eq)
 
-        return z_q, indices, commit_loss, codebook_loss  # [B, D, T], [B, T], ...
+        return z_q, indices, commit_loss, codebook_loss  # [B, D, T], [B, T], [B], [B]
 
     def embed_code(self, embed_id):
         return F.embedding(embed_id, self.codebook.weight)
@@ -211,7 +211,7 @@ class ImprovedRVQ(nn.Module):
             if self.training is False and i >= n_quantizers:
                 break
 
-            z_q_i, indices_i, commit_loss_i, cb_loss_i = quantizer(residual)
+            z_q_i, indices_i, commit_loss_i, codebook_loss_i = quantizer(residual)
 
             # Create mask to apply quantizer dropout
             mask = (torch.full((z.shape[0],), fill_value=i, device=z.device) < n_quantizers)
@@ -219,8 +219,8 @@ class ImprovedRVQ(nn.Module):
             residual = residual - z_q_i
 
             # Sum losses
-            commit_loss += commit_loss_i
-            codebook_loss += cb_loss_i
+            commit_loss += (commit_loss_i * mask).mean()
+            codebook_loss += (codebook_loss_i * mask).mean()
 
             codebook_indices.append(indices_i)
 
