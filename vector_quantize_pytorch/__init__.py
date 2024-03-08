@@ -5,4 +5,4 @@ from vector_quantize_pytorch.finite_scalar_quantization import FSQ
 from vector_quantize_pytorch.lookup_free_quantization import LFQ
 from vector_quantize_pytorch.residual_lfq import ResidualLFQ, GroupedResidualLFQ
 from vector_quantize_pytorch.residual_fsq import ResidualFSQ, GroupedResidualFSQ
-from vector_quantize_pytorch.improved_rvq import ImprovedRVQ
+from vector_quantize_pytorch.improved_rvq import ImprovedRVQ, ImprovedRVQList
