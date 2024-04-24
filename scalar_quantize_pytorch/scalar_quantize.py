@@ -10,8 +10,10 @@ class ScalarQuantize(nn.Module):
         self,
         dim,
         gain=1,
+        codebook_dim=None,
         learnable_gain=False,
         training_q_method='add_noise',
+        inference_q_method='round',
         entropy_model_config=None,
         entropy_loss_ratio=1.0,
         **kwargs,
@@ -20,6 +22,10 @@ class ScalarQuantize(nn.Module):
         
         # Attributes
         self.dim = dim
+        if codebook_dim is None:
+            self.codebook_dim = self.dim
+        else:
+            self.codebook_dim = codebook_dim
         
         # Gain
         gain_shape = (dim,)
@@ -32,8 +38,8 @@ class ScalarQuantize(nn.Module):
         
         # Uniform noise generator
         self.training_q_method = training_q_method    # 'add_noise', 'ste', 'univ'
-        if training_q_method in ['add_noise']:
-            self.noise_sampler = torch.distributions.uniform.Uniform(-0.5, 0.5)
+        self.inference_q_method = inference_q_method  # 'round', 'univ'
+        self.noise_sampler = torch.distributions.uniform.Uniform(-0.5, 0.5)
         
         # Entropy model
         if entropy_model_config is None:
@@ -70,6 +76,8 @@ class ScalarQuantize(nn.Module):
         **kwargs
         ):
         
+        aux_data_dict = {}
+        
         # Apply gain
         x = x * gain
 
@@ -78,22 +86,36 @@ class ScalarQuantize(nn.Module):
             if self.training_q_method == 'add_noise':
                 noise = self.noise_sampler.sample(sample_shape=x.size()).to(x.device)
                 x_q = x + noise
-            elif self.training_q_method == 'ste':
+            elif self.training_q_method == 'ste':   # Rounding with straight-through estimator
                 x_q = torch.round(x)
-                x_q = x + (x_q - x).detach()    # Straight-through estimator
-            else:
-                x_q = torch.round(x)
+                x_q = x + (x_q - x).detach()    
+            elif self.training_q_method == 'univ':  # Universial quantization
+                noise = self.noise_sampler.sample(sample_shape=x.shape[:-1]).to(x.device)       # [B, ...]
+                noise_shift = torch.stack([noise for d in range(x.shape[-1])], dim=noise.dim()) # [B, ..., D]
+                x_q = torch.round(x + noise_shift)
+                x_q = x + (x_q - x).detach()    # STE
+                aux_data_dict['noise_shift'] = noise_shift
         else:
-            x_q = torch.round(x)
+            if self.inference_q_method == 'round':
+                x_q = torch.round(x)
+            elif self.inference_q_method == 'univ':  # Universial quantization
+                noise = self.noise_sampler.sample(sample_shape=x.shape[:-1]).to(x.device)       # [B, ...]
+                noise_shift = torch.stack([noise for d in range(x.shape[-1])], dim=noise.dim()) # [B, ..., D]
+                x_q = torch.round(x + noise_shift)
+                aux_data_dict['noise_shift'] = noise_shift
 
-        return x_q
+        return x_q, aux_data_dict
 
     def inv_quantize(
         self, 
         x_q, 
         inv_gain,
+        aux_data_dict=None,
         **kwargs
         ):       
+        
+        if self.training_q_method == 'univ' or self.inference_q_method == 'univ':
+            x_q = x_q - aux_data_dict['noise_shift']
         
         # Apply inverse gain
         x_q_norm = x_q * inv_gain
@@ -112,10 +134,10 @@ class ScalarQuantize(nn.Module):
         gain, inv_gain = self.get_gain(x)
         
         # Quantization
-        x_q = self.quantize(x, gain)
+        x_q, aux_data_dict = self.quantize(x, gain)
 
         # Inverse quantization
-        x_q_norm = self.inv_quantize(x_q, inv_gain)
+        x_q_norm = self.inv_quantize(x_q, inv_gain, aux_data_dict)
         
         # Evaluate entropy
         info = self.entropy_model.information(x_q_norm, inv_gain=inv_gain)  # [B, ..., D]

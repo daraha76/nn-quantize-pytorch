@@ -302,8 +302,8 @@ class ImprovedRVQList(nn.Module):
             n_active_cb = self.n_codebooks
             
         # Process with each RVQ in the self.quantizers_list
-        for qtz_i in self.n_quantizers:
-            z_q_g, codes_g, commit_loss_g, codebook_loss_g = self.quantizers_list[qtz_i](z[:, qtz_i], n_active_cb)
+        for qg_i in self.n_quantizers:
+            z_q_g, codes_g, commit_loss_g, codebook_loss_g = self.quantizers_list[qg_i](z[:, qg_i], n_active_cb)
 
             z_q.append(z_q_g)       # List of [B, D, T]
             codes.append(codes_g)   # List of [B, T ,Nq]
