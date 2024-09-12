@@ -137,6 +137,7 @@ class ImprovedRVQ(nn.Module):
         codebook_size: int = 1024,
         codebook_dim: Union[int, list] = 8,
         quantizer_dropout: float = 0.0,
+        dropout_num_step: Union[int, None] = None,
         cb_loss_weight:float = 1., 
         commitment_weight:float = 1.,
         **kwargs
@@ -156,6 +157,11 @@ class ImprovedRVQ(nn.Module):
             ]
         )
         self.quantizer_dropout = quantizer_dropout
+        if dropout_num_step == None:
+            self.dropout_num_step = self.n_codebooks
+        else:
+            assert n_codebooks % dropout_num_step == 0 and n_codebooks >= dropout_num_step:
+            self.dropout_num_step = dropout_num_step
         
         self.cb_loss_weight = cb_loss_weight
         self.commitment_weight = commitment_weight
@@ -197,7 +203,10 @@ class ImprovedRVQ(nn.Module):
             n_active_cb = self.n_codebooks
         if self.training:
             n_active_cb = torch.ones((z.shape[0],)) * self.n_codebooks + 1
-            dropout = torch.randint(1, self.n_codebooks + 1, (z.shape[0],))
+            if self.dropout_num_step == self.n_codebooks:
+                dropout = torch.randint(1, self.n_codebooks + 1, (z.shape[0],))
+            else:
+                dropout = torch.randint(1, self.dropout_num_step + 1, (z.shape[0],)) * self.dropout_num_step
             n_dropout = int(z.shape[0] * self.quantizer_dropout)
             n_active_cb[:n_dropout] = dropout[:n_dropout]
             n_active_cb = n_active_cb.to(z.device)
