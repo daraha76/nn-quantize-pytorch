@@ -160,7 +160,7 @@ class ImprovedRVQ(nn.Module):
         if dropout_num_step == None:
             self.dropout_num_step = self.n_codebooks
         else:
-            assert n_codebooks % dropout_num_step == 0 and n_codebooks >= dropout_num_step:
+            assert n_codebooks % dropout_num_step == 0 and n_codebooks >= dropout_num_step
             self.dropout_num_step = dropout_num_step
         
         self.cb_loss_weight = cb_loss_weight
@@ -206,7 +206,7 @@ class ImprovedRVQ(nn.Module):
             if self.dropout_num_step == self.n_codebooks:
                 dropout = torch.randint(1, self.n_codebooks + 1, (z.shape[0],))
             else:
-                dropout = torch.randint(1, self.dropout_num_step + 1, (z.shape[0],)) * self.dropout_num_step
+                dropout = torch.randint(1, self.dropout_num_step + 1, (z.shape[0],)) * (self.n_codebooks // self.dropout_num_step)
             n_dropout = int(z.shape[0] * self.quantizer_dropout)
             n_active_cb[:n_dropout] = dropout[:n_dropout]
             n_active_cb = n_active_cb.to(z.device)
