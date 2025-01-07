@@ -193,6 +193,9 @@ class ImprovedRVQ(nn.Module):
             "codebook_loss" : Tensor[1]
                 Codebook loss to update the codebook
         """
+        if self.n_codebooks == 0:
+            return torch.zeros_like(z).to(z.device), None, torch.Tensor([0.0]).to(z.device), torch.Tensor([0.0]).to(z.device)
+        
         z_q = 0
         residual = z
         commit_loss = 0
