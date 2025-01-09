@@ -137,6 +137,7 @@ class ImprovedRVQ(nn.Module):
         codebook_size: int = 1024,
         codebook_dim: Union[int, list] = 8,
         quantizer_dropout: float = 0.0,
+        dropout_num_step: Union[int, None] = None,
         cb_loss_weight:float = 1., 
         commitment_weight:float = 1.,
         **kwargs
@@ -156,6 +157,11 @@ class ImprovedRVQ(nn.Module):
             ]
         )
         self.quantizer_dropout = quantizer_dropout
+        if dropout_num_step == None:
+            self.dropout_num_step = self.n_codebooks
+        else:
+            assert n_codebooks % dropout_num_step == 0 and n_codebooks >= dropout_num_step
+            self.dropout_num_step = dropout_num_step
         
         self.cb_loss_weight = cb_loss_weight
         self.commitment_weight = commitment_weight
@@ -187,6 +193,9 @@ class ImprovedRVQ(nn.Module):
             "codebook_loss" : Tensor[1]
                 Codebook loss to update the codebook
         """
+        if self.n_codebooks == 0:
+            return torch.zeros_like(z).to(z.device), None, torch.Tensor([0.0]).to(z.device), torch.Tensor([0.0]).to(z.device)
+        
         z_q = 0
         residual = z
         commit_loss = 0
@@ -197,13 +206,18 @@ class ImprovedRVQ(nn.Module):
             n_active_cb = self.n_codebooks
         if self.training:
             n_active_cb = torch.ones((z.shape[0],)) * self.n_codebooks + 1
-            dropout = torch.randint(1, self.n_codebooks + 1, (z.shape[0],))
+            if self.dropout_num_step == self.n_codebooks:
+                dropout = torch.randint(1, self.n_codebooks + 1, (z.shape[0],))
+            else:
+                dropout = torch.randint(1, self.dropout_num_step + 1, (z.shape[0],)) * (self.n_codebooks // self.dropout_num_step)
             n_dropout = int(z.shape[0] * self.quantizer_dropout)
             n_active_cb[:n_dropout] = dropout[:n_dropout]
             n_active_cb = n_active_cb.to(z.device)
 
         for i, quantizer in enumerate(self.quantizers):
             if self.training is False and i >= n_active_cb:
+                if i == 0:
+                    z_q = torch.zeros_like(z).to(z.device)
                 break
 
             z_q_i, indices_i, commit_loss_i, codebook_loss_i = quantizer(residual)
@@ -219,7 +233,10 @@ class ImprovedRVQ(nn.Module):
 
             codebook_indices.append(indices_i)
 
-        codes = torch.stack(codebook_indices, dim=-1)    # [B, T, Nq]
+        if self.training is False and n_active_cb >= 1:
+            codes = torch.stack(codebook_indices, dim=-1)    # [B, T, Nq]
+        else:
+            codes = None
 
         return z_q, codes, commit_loss, codebook_loss # [B, D, T], [B, T, Nq], ...
 

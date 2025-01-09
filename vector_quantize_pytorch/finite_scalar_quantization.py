@@ -43,8 +43,8 @@ class FSQ(Module):
         self,
         levels: List[int],
         dim: Optional[int] = None,
-        num_codebooks = 1,
-        keep_num_codebooks_dim: Optional[bool] = None,
+        n_codebooks = 1,
+        keep_n_codebooks_dim: Optional[bool] = None,
         scale: Optional[float] = None
     ):
         super().__init__()
@@ -59,15 +59,15 @@ class FSQ(Module):
         codebook_dim = len(levels)
         self.codebook_dim = codebook_dim
 
-        effective_codebook_dim = codebook_dim * num_codebooks
-        self.num_codebooks = num_codebooks
+        effective_codebook_dim = codebook_dim * n_codebooks
+        self.n_codebooks = n_codebooks
         self.effective_codebook_dim = effective_codebook_dim
 
-        keep_num_codebooks_dim = default(keep_num_codebooks_dim, num_codebooks > 1)
-        assert not (num_codebooks > 1 and not keep_num_codebooks_dim)
-        self.keep_num_codebooks_dim = keep_num_codebooks_dim
+        keep_n_codebooks_dim = default(keep_n_codebooks_dim, n_codebooks > 1)
+        assert not (n_codebooks > 1 and not keep_n_codebooks_dim)
+        self.keep_n_codebooks_dim = keep_n_codebooks_dim
 
-        self.dim = default(dim, len(_levels) * num_codebooks)
+        self.dim = default(dim, len(_levels) * n_codebooks)
 
         has_projections = self.dim != effective_codebook_dim
         self.project_in = nn.Linear(self.dim, effective_codebook_dim) if has_projections else nn.Identity()
@@ -113,13 +113,13 @@ class FSQ(Module):
     ) -> Tensor:
         """Inverse of `codes_to_indices`."""
 
-        is_img_or_video = indices.ndim >= (3 + int(self.keep_num_codebooks_dim))
+        is_img_or_video = indices.ndim >= (3 + int(self.keep_n_codebooks_dim))
 
         indices = rearrange(indices, '... -> ... 1')
         codes_non_centered = (indices // self._basis) % self._levels
         codes = self._scale_and_shift_inverse(codes_non_centered)
 
-        if self.keep_num_codebooks_dim:
+        if self.keep_n_codebooks_dim:
             codes = rearrange(codes, '... c d -> ... (c d)')
 
         if project_out:
@@ -151,7 +151,7 @@ class FSQ(Module):
 
         z = self.project_in(z)
 
-        z = rearrange(z, 'b n (c d) -> b n c d', c = self.num_codebooks)
+        z = rearrange(z, 'b n (c d) -> b n c d', c = self.n_codebooks)
 
         codes = self.quantize(z)
         indices = self.codes_to_indices(codes)
@@ -168,7 +168,7 @@ class FSQ(Module):
 
             indices = unpack_one(indices, ps, 'b * c')
 
-        if not self.keep_num_codebooks_dim:
+        if not self.keep_n_codebooks_dim:
             indices = rearrange(indices, '... 1 -> ...')
 
         return out, indices

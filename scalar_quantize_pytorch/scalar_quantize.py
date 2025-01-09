@@ -144,7 +144,8 @@ class ScalarQuantize(nn.Module):
                 noise = self.noise_sampler.sample(sample_shape=x.shape[:-1]).to(x.device)       # [B, ...]
                 noise_shift = torch.stack([noise for d in range(x.shape[-1])], dim=noise.dim()) # [B, ..., D]
                 x_q = torch.round(x + noise_shift)
-                x_q = x + (x_q - x).detach()    # STE
+                # x_q = x + (x_q - x).detach()    # STE (TODO: wrong position?)
+                aux_data_dict['x_before_round'] = x
                 aux_data_dict['noise_shift'] = noise_shift
             elif self.training_q_method == 'noq':
                 x_q = x
@@ -172,6 +173,8 @@ class ScalarQuantize(nn.Module):
         
         if (self.training_q_method == 'univ' or self.inference_q_method == 'univ') and not skip_dither:
             x_q = x_q - aux_data_dict['noise_shift']
+            x_before_round = aux_data_dict['x_before_round']
+            x_q = x_before_round + (x_q - x_before_round).detach()  # STE as if univ_q without scaling is not exist!
         
         # Apply inverse gain
         x_q_norm = x_q * inv_gain
