@@ -96,6 +96,77 @@ class FullyFactorizedEntropyModel(nn.Module):
     def information(self, x_qn, inv_gain=None):
         return -torch.log2(torch.clamp(self.pmf(x_qn, inv_gain), min=1e-20))
 
+    def get_percentile_interval(self, out_of_bound_pct, inv_gain=None, num_max_range=1000):
+        # Calculate bound in integer domain
+        # Decide boundary in normalized domain (after multipling inv_gain)
+        # out_of_bound_pct: sum of percentage of out-of-bound regions
+        
+        oob_half = out_of_bound_pct / 200   # in probability
+        
+        # num_max_range = 6
+        # bin_range     = -3.5 -2.5 -1.5 -0.5 0.5 1.5 2.5 3.5
+        # int_range     =     -3   -2   -1   0   1   2   3
+        bin_range = torch.arange(-num_max_range/2 - 0.5, num_max_range/2 + 1.5)
+        bin_range = torch.tile(bin_range.unsqueeze(1), (1, self.input_dim))    # [max_range+1+1, d]
+        bin_range_norm = bin_range * inv_gain
+        cdf_per_dim = self.cdf(bin_range_norm)
+        
+        int_range = torch.arange(-num_max_range/2, num_max_range/2 + 1)
+        int_range = torch.tile(int_range.unsqueeze(1), (1, self.input_dim)) # [max_range+1, d]
+        int_range_norm = int_range * inv_gain
+        pmf_per_dim_full = self.pmf(int_range_norm, inv_gain)
+        
+        len_cdf = len(cdf_per_dim)
+        bound_per_dim = torch.empty((self.input_dim, 2))    # [d, 2]
+        actual_oob_prob_per_dim = torch.empty((self.input_dim, 2))    # [d, 2]
+        
+        pmf_per_dim =torch.zeros((self.input_dim, num_max_range+1))    # [d, max_range+1]
+        
+        # bin_range     = -3.5 -2.5 -1.5 -0.5 0.5 1.5 2.5 3.5
+        #                        o----|
+        #                       idx=2 ^
+        #              low_idx=1 ^
+        # act_oob       = -------|
+        #                                      |---o
+        #                                idx=4 ^
+        #                                upp_idx=5 ^
+        # act_oob       =                          o---------
+        # int_range     =     -3   -2   -1   0   1   2   3
+        # bound         =           ^            ^
+        # bound_per_dim =         [-2,           1]
+        # pmf           =           ^    ^   ^   ^
+        
+        for d_i in range(self.input_dim):
+            # Find lower bound idx
+            low_idx = len_cdf - 1
+            for idx in range(len_cdf):
+                if cdf_per_dim[idx, d_i] >= oob_half:
+                    low_idx = idx - 1 if idx >= 1 else 0
+                    actual_oob_prob_per_dim[d_i, 0] = cdf_per_dim[low_idx, d_i]
+                    break
+            bound_per_dim[d_i, 0] = bin_range[low_idx, 0] + 0.5
+            
+            # Find upper bound idx
+            upp_idx = 0
+            for idx in range(len_cdf - 1, -1, -1):
+                if cdf_per_dim[idx, d_i] <= 1 - oob_half:
+                    upp_idx = idx + 1 if idx < len_cdf - 1 else len_cdf - 1
+                    actual_oob_prob_per_dim[d_i, 1] = 1 - cdf_per_dim[upp_idx, d_i]
+                    break
+            bound_per_dim[d_i, 1] = bin_range[upp_idx, 0] - 0.5
+
+            # Probability table
+            # [low_idx, ..., upp_idx, oob_low, oob_high, 0, ..., 0]
+            pmf_per_dim[d_i, 0: upp_idx - low_idx] = pmf_per_dim_full[low_idx: upp_idx, d_i]
+            pmf_per_dim[d_i, upp_idx - low_idx: upp_idx - low_idx + 2] = actual_oob_prob_per_dim[d_i, :]
+        
+        # Aggregate probabilities
+        used_max_range = int((bound_per_dim[:, 1] - bound_per_dim[:, 0] + 1).max())
+        pmf_per_dim = pmf_per_dim[:, :used_max_range + 2]
+            
+        return bound_per_dim, cdf_per_dim, pmf_per_dim
+
+
     @torch.no_grad()
     def get_distribution(self,
             target='pdf', xmin=-10, xmax=10,
@@ -277,17 +348,17 @@ class CDFMappingBlock(nn.Module):
 
 class Hyperprior(nn.Module):
     # TODO
-    def __init__(**kwargs):
-        1
+    def __init__(self, **kwargs):
+        super().__init__()
     
-    def information(**kwargs):
+    def information(self, **kwargs):
         return None
 
 class NoEM(nn.Module):
     # Empty entropy model
-    def __init__(**kwargs):
-        1
+    def __init__(self, **kwargs):
+        super().__init__()
     
-    def information(**kwargs):
-        return None
+    def information(self, x_qn, inv_gain=None, **kwargs):
+        return torch.Tensor([0]).to(x_qn.device)
     
