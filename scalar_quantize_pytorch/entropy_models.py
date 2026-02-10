@@ -2,6 +2,108 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange, repeat, reduce, pack, unpack
+import numpy as np
+
+class FourierBaseEntropyModel(nn.Module):
+    # De la Fuente, Alfredo, Saurabh Singh, and Johannes Ballé. "Fourier Basis Density Model." 2024 Picture Coding Symposium (PCS). IEEE, 2024.
+    def __init__(
+        self,
+        dim,
+        num_coeff,
+        **kwargs
+        ):
+        super().__init__()
+        
+        self.input_dim = dim
+        
+        # Learnable coefficients
+        self.num_coeff = num_coeff # N
+        self.coeff_params = nn.Parameter(torch.complex(real=torch.rand(dim, num_coeff+1), imag=torch.rand(dim, num_coeff+1)))   #(a_N, ..., a_0) [D, N]
+        
+        # Scale & offset
+        self.scale = nn.Parameter(torch.ones(1, dim, 1))   # s
+        self.offset = nn.Parameter(torch.ones(1, dim, 1) * 1.0e-4) # t
+    
+    def get_coeffs(self, **kwargs):
+        """
+        Get Fourier Series coefficients (c_0, ..., c_N) from parameters (a_N, ..., a_0)
+        """
+        # Calculate FS coefficients c_0, ..., c_N using autocorrelation (TODO: faster algorithm?)
+        params_pad = F.pad(self.coeff_params, (0, self.num_coeff), value=0) # (a_N, ..., a_0, 0 x N)
+        params_conj = torch.conj(self.coeff_params) # (a*_N, ..., a*_0)
+        # Group conv with G = D
+        # input: [1, D, 2N+1], weight: [D, D/G=1, N]
+        # https://pytorch.org/docs/stable/generated/torch.nn.functional.conv1d.html
+        fs_coeffs = F.conv1d(input=params_pad.unsqueeze(0), weight=params_conj.unsqueeze(1), bias=False).squeeze(0)  # (c_N, ..., C_0) [D, N]
+        fs_coeffs = torch.flip(fs_coeffs, [-1]) # (c_0, ..., C_N) [D, N]
+        
+        return fs_coeffs
+
+    def coeffs_reg_loss(self, gamma, **kwargs):
+        """
+        Regularization loss for smoother density
+        """
+        weights = gamma * 2 * (np.pi * torch.arange(1, self.num_coeff+1).unsqueeze(0))**2  # [1 , N]
+        fs_coeffs_sq = torch.abs(self.get_coeffs)**2   # [D, N+1]
+        
+        return 2 * torch.sum(weights * fs_coeffs_sq[:, 1:]) / self.input_dim
+
+    def cdf(self, x, **kwargs):
+        """
+        Evalute the channel-wise CDF, P(X < x)
+        """
+        # Real value support into [-1, 1] support
+        x = F.tanh((x - self.offset) / self.scale)  # [BT, D, 1]
+        
+        # Get FS coefficients
+        fs_coeffs = self.get_coeffs()
+        
+        # Calculate CDF
+        cdf = x / 2     # [BT, D, 1]
+        x_exp = torch.exp(torch.tensor([1j * np.pi]) * torch.arange(1, self.input_dim+1).reshape(1, 1, -1)) * x  # [BT, D, N]
+        norm_coeffs = fs_coeffs / (torch.tensor([1j * np.pi]) * torch.arange(1, self.input_dim+1).reshape(1, -1) * fs_coeffs[:, 0:1])   # [D, N]
+        cdf = cdf + norm_coeffs.unsqueeze(0) * x_exp
+        cdf = cdf.real  # TODO: is it neccesary?
+        
+        return cdf
+    
+    def pmf(self, x_qn, inv_gain=None, **kwargs):
+                
+        prob = (self.cdf(x_qn + inv_gain/2) - self.cdf(x_qn - inv_gain/2))
+        
+        return prob
+
+    def information(self, x_qn, inv_gain=None):
+        return -torch.log2(torch.clamp(self.pmf(x_qn, inv_gain), min=1e-20))    
+    
+    def _initial_reshape(self, x):
+        # [B, D] -> [B, D, 1] or [B, T, D] -> [BT, D, 1]
+
+        # Check the shape of the input tensor
+        assert x.shape[-1] == self.input_dim, "Channel dimension does not match the entropy model's spec."
+        
+        bsz = x.shape[0]    # Batch size
+        num_frames = int(torch.numel(x) / (bsz * self.input_dim))   # Number of frames
+        
+        # Reshape
+        if x.dim() == 2:
+            assert num_frames == 1
+            x = rearrange(x, 'b d -> b d 1')
+            
+        x = rearrange(x, 'b f d -> (b f) d 1')
+
+        return x, num_frames
+
+    def _final_reshape(self, x, num_frames):
+        # [BT, D, 1] -> [B, T, D] or [B, D, 1] -> [B, D]
+
+        x = rearrange(x, '(b f) d 1 -> b f d', f=num_frames)
+
+        if num_frames == 1:
+            x = rearrange(x, 'b d 1 -> b d')
+
+        return x
+
 
 class FullyFactorizedEntropyModel(nn.Module):
     def __init__(
@@ -206,7 +308,7 @@ class FullyFactorizedEntropyModel(nn.Module):
         # Reshape
         if x.dim() == 2:
             assert num_frames == 1
-            x = rearrange(x, 'b d -> b 1 d')
+            x = rearrange(x, 'b d -> b d 1')
             
         x = rearrange(x, 'b f d -> (b f) d 1')
 
@@ -218,7 +320,7 @@ class FullyFactorizedEntropyModel(nn.Module):
         x = rearrange(x, '(b f) d 1 -> b f d', f=num_frames)
 
         if num_frames == 1:
-            x = rearrange(x, 'b 1 d -> b d')
+            x = rearrange(x, 'b d 1 -> b d')
 
         return x
 

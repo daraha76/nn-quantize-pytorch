@@ -165,6 +165,9 @@ class ImprovedRVQ(nn.Module):
         
         self.cb_loss_weight = cb_loss_weight
         self.commitment_weight = commitment_weight
+        
+        self.training_q_method = 'vq'
+        self.inference_q_method = 'vq'
 
     def forward(self, z, n_active_cb: int = None):
         """Quantized the input tensor using a fixed set of `n` codebooks and returns
@@ -251,8 +254,8 @@ class ImprovedRVQList(nn.Module):
         self,
         dim: int = 512,
         n_quantizers: int = 32,
-        n_codebooks: int = 9,
-        codebook_size: int = 1024,
+        n_codebooks: Union[int, list] = 9,
+        codebook_size: Union[int, list] = 1024,
         codebook_dim: Union[int, list] = 8,
         quantizer_dropout: float = 0.0,
         cb_loss_weight:float = 1., 
@@ -263,16 +266,24 @@ class ImprovedRVQList(nn.Module):
         
         self.n_quantizers = n_quantizers
         
+        if isinstance(n_codebooks, int):
+            n_codebooks = [n_codebooks for _ in range(n_quantizers)]
+        if isinstance(codebook_size, int):
+            codebook_size = [codebook_size for _ in range(n_quantizers)]
         if isinstance(codebook_dim, int):
-            codebook_dim = [codebook_dim for _ in range(n_codebooks)]
+            codebook_dim = [codebook_dim for _ in range(n_quantizers)]
+            
+        assert n_quantizers == len(n_codebooks)
+        assert n_quantizers == len(codebook_size)
+        assert n_quantizers == len(codebook_dim)
 
         self.n_codebooks = n_codebooks
-        self.codebook_dim = codebook_dim
         self.codebook_size = codebook_size
+        self.codebook_dim = codebook_dim
 
         self.quantizers_list = nn.ModuleList(
             [
-                ImprovedRVQ(dim, codebook_size, n_codebooks, codebook_dim[i], cb_loss_weight, commitment_weight)
+                ImprovedRVQ(dim, n_codebooks[i], codebook_size[i], codebook_dim[i], cb_loss_weight=cb_loss_weight, commitment_weight=commitment_weight, quantizer_dropout=quantizer_dropout)
                 for i in range(n_quantizers)
             ]
         )
@@ -280,6 +291,9 @@ class ImprovedRVQList(nn.Module):
         
         self.cb_loss_weight = cb_loss_weight
         self.commitment_weight = commitment_weight
+        
+        self.training_q_method = 'vq'
+        self.inference_q_method = 'vq'
 
     def forward(self, z, n_active_cb: int = None):
         """Quantized the input tensor using a fixed set of `n` codebooks and returns
@@ -319,8 +333,8 @@ class ImprovedRVQList(nn.Module):
             n_active_cb = self.n_codebooks
             
         # Process with each RVQ in the self.quantizers_list
-        for qg_i in self.n_quantizers:
-            z_q_g, codes_g, commit_loss_g, codebook_loss_g = self.quantizers_list[qg_i](z[:, qg_i], n_active_cb)
+        for qg_i in range(self.n_quantizers):
+            z_q_g, codes_g, commit_loss_g, codebook_loss_g = self.quantizers_list[qg_i](z[:, qg_i], n_active_cb[qg_i])
 
             z_q.append(z_q_g)       # List of [B, D, T]
             codes.append(codes_g)   # List of [B, T ,Nq]
@@ -329,6 +343,7 @@ class ImprovedRVQList(nn.Module):
 
         # Output aggregation
         z_q = torch.stack(z_q, dim=1)       # [B, G, D, T]
-        codes = torch.stack(codes, dim=1)   # [B, G, T, Nq]
+        if self.training or n_active_cb is None:
+            codes = None
 
-        return z_q, codes, commit_loss, codebook_loss # [B, D, T], [B, T, Nq], ...
+        return z_q, codes, commit_loss, codebook_loss # [B, G, D, T], List of [B, T, Nq], ...

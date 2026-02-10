@@ -18,7 +18,10 @@ class ScalarQuantize(nn.Module):
         entropy_model_config=None,
         entropy_loss_ratio=1.0,
         num_rate_option=1,
+        cont_rate_train=False,
         is_skip_q=False,
+        info_skip_dither=False,
+        q_dropout=None,
         **kwargs,
         ):
         super().__init__()
@@ -40,7 +43,7 @@ class ScalarQuantize(nn.Module):
         self.num_rate_option = num_rate_option
         self.is_skip_q = is_skip_q
         if self.is_skip_q:
-            self.q_dropout = 1 / (1 + self.num_rate_option)
+            self.q_dropout = 1 / (1 + self.num_rate_option) if q_dropout is None else q_dropout
 
         # Gain
         if num_rate_option == 1:
@@ -75,11 +78,16 @@ class ScalarQuantize(nn.Module):
         elif num_rate_option > 1: 
             assert len(entropy_loss_ratio) == num_rate_option
             self.register_buffer("entropy_loss_ratio", torch.Tensor(entropy_loss_ratio))
+        self.cont_rate_train = cont_rate_train        
+        self.info_skip_dither = info_skip_dither
     
     def init_gain(self,
         new_gain,
         **kwargs
     ):
+        if self.learnable_gain:
+                new_gain = torch.log(new_gain)
+                
         if self.num_rate_option == 1:
             assert new_gain.dim() == 1
             self.gain.data = new_gain
@@ -99,14 +107,19 @@ class ScalarQuantize(nn.Module):
         **kwargs
         ):
         if rate_option is not None:
-            if isinstance(rate_option, int):
-                gain = self.gain[rate_option]               # [D]
+            if isinstance(rate_option, int) or (isinstance(rate_option, float) and rate_option >= self.num_rate_option - 1):
+                gain = self.gain[int(rate_option)]               # [D]
             elif isinstance(rate_option, float):
                 rate_opt_int = int(rate_option)
                 rate_opt_rmd = rate_option - rate_opt_int
                 gain = torch.pow(self.gain[rate_opt_int], 1 - rate_opt_rmd) * torch.pow(self.gain[rate_opt_int + 1], rate_opt_rmd)
-            else:
-                gain = self.gain[rate_option].unsqueeze(1)  # [B, 1, D]
+            else: # Rate options in torch.Tensor
+                if self.cont_rate_train:
+                    rate_opt_int = torch.floor(rate_option).long()  # This will NOT be "num_rate_option-1" (maximum), due to torch.rand()!
+                    rate_opt_rmd = rate_option - rate_opt_int
+                    gain = torch.pow(self.gain[rate_opt_int], 1 - rate_opt_rmd) * torch.pow(self.gain[rate_opt_int + 1], rate_opt_rmd)
+                else: # All entries are int
+                    gain = self.gain[rate_option].unsqueeze(1)  # [B, 1, D]
         else:
             gain = self.gain                                # [D]
 
@@ -169,16 +182,19 @@ class ScalarQuantize(nn.Module):
         aux_data_dict=None,
         skip_dither=False,
         **kwargs
-        ):       
-        
-        if (self.training_q_method == 'univ' or self.inference_q_method == 'univ') and not skip_dither:
-            x_q = x_q - aux_data_dict['noise_shift']
+        ):      
+        if self.training and self.training_q_method == 'univ':
+            if not skip_dither:
+                x_q = x_q - aux_data_dict['noise_shift']
             x_before_round = aux_data_dict['x_before_round']
             x_q = x_before_round + (x_q - x_before_round).detach()  # STE as if univ_q without scaling is not exist!
+
+        if not self.training and self.inference_q_method == 'univ' and not skip_dither:
+            x_q = x_q - aux_data_dict['noise_shift']
         
         # Apply inverse gain
         x_q_norm = x_q * inv_gain
-                    
+           
         return x_q_norm
     
     def forward(
@@ -186,13 +202,17 @@ class ScalarQuantize(nn.Module):
         x,
         return_info=False,
         rate_option=None,   # int or [B]
+        info_skip_dither=None,
         **kwargs
         ):
         assert x.shape[-1] == self.dim, "Input must have shape of [B, ..., D]"
+
+        if info_skip_dither is None:
+            info_skip_dither = self.info_skip_dither
         
         # Quantizer dropout (only during training)
         if self.training and self.is_skip_q:
-            dropout_idx = (torch.randperm(len(x)) + 1 <= len(x) * self.q_dropout).to(x.device)
+            dropout_idx = (rate_option == -1)
             _x = x[~dropout_idx]    # Only those will pass quantizer
             _rate_option = rate_option[~dropout_idx]
         else:
@@ -207,9 +227,13 @@ class ScalarQuantize(nn.Module):
         
         # Quantization
         xp_q, aux_data_dict = self.quantize(xp, gain)
-
+        
         # Inverse quantization
-        xp_q_norm = self.inv_quantize(xp_q, inv_gain, aux_data_dict)
+        if info_skip_dither:
+            xp_bar_norm = self.inv_quantize(xp_q, inv_gain, aux_data_dict, skip_dither=True)
+            xp_q_norm = xp_bar_norm - aux_data_dict['noise_shift'] * inv_gain
+        else:
+            xp_q_norm = self.inv_quantize(xp_q, inv_gain, aux_data_dict)
         
         # Projection
         _x_hat = self.out_proj(xp_q_norm)
@@ -222,15 +246,24 @@ class ScalarQuantize(nn.Module):
             x_hat = _x_hat
         
         # Evaluate entropy
-        info = self.entropy_model.information(xp_q_norm, inv_gain=inv_gain)  # [B, ..., D]
+        if info_skip_dither:
+            info = self.entropy_model.information(xp_bar_norm, inv_gain=inv_gain)  # [B, ..., D]
+        else:
+            info = self.entropy_model.information(xp_q_norm, inv_gain=inv_gain)  # [B, ..., D]
         if info is not None:
             if self.num_rate_option == 1:
                 entropy_loss = torch.mean(torch.sum(info, dim=-1)) * self.entropy_loss_ratio
             elif self.num_rate_option > 1:
                 if isinstance(rate_option, float):
                     entropy_loss = None
-                else:
-                    entropy_loss = torch.mean(torch.mean(torch.sum(info, dim=-1), dim=-1) * self.entropy_loss_ratio[_rate_option])
+                else:   # rate_option is torch.Tensor
+                    if self.cont_rate_train:
+                        rate_opt_int = torch.floor(_rate_option).long()  # This will NOT be "num_rate_option-1" (maximum), due to torch.rand()!
+                        rate_opt_rmd = _rate_option - rate_opt_int
+                        loss_ratio = torch.pow(self.entropy_loss_ratio[rate_opt_int], 1 - rate_opt_rmd) * torch.pow(self.entropy_loss_ratio[rate_opt_int + 1], rate_opt_rmd)
+                        entropy_loss = torch.mean(torch.mean(torch.sum(info, dim=-1), dim=-1) * loss_ratio)
+                    else:
+                        entropy_loss = torch.mean(torch.mean(torch.sum(info, dim=-1), dim=-1) * self.entropy_loss_ratio[_rate_option])
         else:
             entropy_loss = None
         
@@ -266,17 +299,28 @@ class ScalarQuantize(nn.Module):
         aux_data_dict,
         return_info=False,
         skip_dither=False,
+        info_skip_dither=None,
         rate_option=None,   # int or [B]
         **kwargs
         ):
+        if info_skip_dither is None:
+            info_skip_dither = self.info_skip_dither
+
         # Inverse quantization
-        xp_q_norm = self.inv_quantize(xp_q, inv_gain, aux_data_dict, skip_dither=skip_dither)
+        if info_skip_dither:
+            xp_bar_norm = self.inv_quantize(xp_q, inv_gain, aux_data_dict, skip_dither=True)
+            xp_q_norm = xp_bar_norm - aux_data_dict['noise_shift'] * inv_gain
+        else:
+            xp_q_norm = self.inv_quantize(xp_q, inv_gain, aux_data_dict)
         
         # Projection
         x_hat = self.out_proj(xp_q_norm)
         
         # Evaluate entropy
-        info = self.entropy_model.information(xp_q_norm, inv_gain=inv_gain)  # [B, ..., D]
+        if not skip_dither and info_skip_dither:
+            info = self.entropy_model.information(xp_bar_norm, inv_gain=inv_gain)  # [B, ..., D]
+        else:
+            info = self.entropy_model.information(xp_q_norm, inv_gain=inv_gain)  # [B, ..., D]
         if info is not None:
             if self.num_rate_option == 1:
                 entropy_loss = torch.mean(torch.sum(info, dim=-1)) * self.entropy_loss_ratio
